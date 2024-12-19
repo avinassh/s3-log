@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -18,6 +19,7 @@ type S3WAL struct {
 	bucketName string
 	prefix     string
 	length     uint64
+	mu         sync.Mutex
 }
 
 func NewS3WAL(client *s3.Client, bucketName, prefix string) *S3WAL {
@@ -66,16 +68,22 @@ func prepareBody(offset uint64, data []byte) ([]byte, error) {
 }
 
 func (w *S3WAL) Append(ctx context.Context, data []byte) (uint64, error) {
+	w.mu.Lock() // Acquire the lock
+	defer w.mu.Unlock()
 	nextOffset := w.length + 1
+	// nextOffset := atomic.AddUint64(&w.length, 1) // Atomic increment
+	// https://stackoverflow.com/questions/15056237/which-is-more-efficient-basic-mutex-lock-or-atomic-integer
+	// w.mu.Unlock()
 
 	buf, err := prepareBody(nextOffset, data)
 	if err != nil {
 		return 0, fmt.Errorf("failed to prepare object body: %w", err)
 	}
-
+	key := w.getObjectKey(nextOffset)
+	fmt.Printf("Putting object with key: %s\n", key) // Crucial logging
 	input := &s3.PutObjectInput{
 		Bucket:      aws.String(w.bucketName),
-		Key:         aws.String(w.getObjectKey(nextOffset)),
+		Key:         aws.String(key),
 		Body:        bytes.NewReader(buf),
 		IfNoneMatch: aws.String("*"),
 	}
@@ -83,6 +91,7 @@ func (w *S3WAL) Append(ctx context.Context, data []byte) (uint64, error) {
 	if _, err = w.client.PutObject(ctx, input); err != nil {
 		return 0, fmt.Errorf("failed to put object to S3: %w", err)
 	}
+
 	w.length = nextOffset
 	return nextOffset, nil
 }
