@@ -2,11 +2,13 @@ package s3_log
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/rand"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -129,7 +131,6 @@ func TestAppendAndReadSingle(t *testing.T) {
 		t.Errorf("data mismatch: expected %q, got %q", testData, record.Data)
 	}
 }
-
 func TestAppendMultiple(t *testing.T) {
 	wal, cleanup := getWAL(t)
 	defer cleanup()
@@ -164,6 +165,62 @@ func TestAppendMultiple(t *testing.T) {
 		if string(record.Data) != string(testData[i]) {
 			t.Errorf("data mismatch at offset %d: expected %q, got %q",
 				offset, testData[i], record.Data)
+		}
+	}
+}
+
+func TestAppendMultipleConcurrency(t *testing.T) {
+	wal, cleanup := getWAL(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	// Random data generation
+	numData := 100
+	data := make([][]byte, numData)
+	rand.Seed(time.Now().UnixNano()) // Seed the random number generator
+
+	for i := range data {
+		dataLen := rand.Intn(100) + 1 // Generate random data length between 1 and 100
+		data[i] = make([]byte, dataLen)
+		for j := range data[i] {
+			data[i][j] = byte(rand.Intn(256)) // Generate random byte values
+		}
+	}
+
+	var wg sync.WaitGroup
+	offsets := make([]uint64, len(data)) // Pre-allocate the offsets slice
+
+	for i, data := range data {
+		wg.Add(1)
+		go func(i int, data []byte) {
+			defer wg.Done()
+
+			offset, err := wal.Append(ctx, data)
+			if err != nil {
+				t.Errorf("failed to append data %d: %v", i, err)
+				return // Exit the goroutine on error
+			}
+			offsets[i] = offset
+		}(i, data)
+	}
+
+	// Wait for all goroutines to finish appending
+	wg.Wait()
+
+	// Now read and verify data
+	for i, offset := range offsets {
+		record, err := wal.Read(ctx, offset)
+		if err != nil {
+			t.Fatalf("failed to read offset %d: %v", offset, err)
+		}
+
+		if record.Offset != offset {
+			t.Errorf("offset mismatch: expected %d, got %d", offset, record.Offset)
+		}
+
+		if string(record.Data) != string(data[i]) {
+			t.Errorf("data mismatch at offset %d: expected %q, got %q",
+				offset, data[i], record.Data)
 		}
 	}
 }
